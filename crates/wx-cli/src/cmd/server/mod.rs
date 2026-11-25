@@ -9,6 +9,7 @@ use crate::cmd::serve;
 
 pub async fn cmd_server(action: ServerAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
+        ServerAction::Foreground(args) => cmd_server_worker(args).await,
         ServerAction::Run(args) => manager::cmd_server_run(args).await,
         ServerAction::Status(args) => manager::cmd_server_status(args),
         ServerAction::Stop(args) => manager::cmd_server_stop(args).await,

@@ -87,7 +87,7 @@ unsafe extern "C" fn x_tokenize(
         let cstr = std::ffi::CStr::from_ptr(text);
         cstr.to_bytes()
     } else {
-        std::slice::from_raw_parts(text as *const u8, n_text as usize)
+        std::slice::from_raw_parts(text.cast::<u8>(), n_text as usize)
     };
 
     let Some(x_tok_fn) = x_token else {

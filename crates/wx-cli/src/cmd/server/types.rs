@@ -122,6 +122,8 @@ pub struct ServerWorkerArgs {
 
 #[derive(Subcommand, Clone, Debug)]
 pub enum ServerAction {
+    /// Run the HTTP service in the foreground (Docker/systemd)
+    Foreground(ServerWorkerArgs),
     /// Start the managed HTTP service
     Run(ServerRunArgs),
     /// Show managed service status

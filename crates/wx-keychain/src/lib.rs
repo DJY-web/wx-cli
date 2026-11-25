@@ -1,5 +1,9 @@
 pub mod account_id;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod linux_capture;
 pub mod lldb;
 pub mod mach_vm;
 pub mod nickname;
@@ -10,6 +14,8 @@ pub mod store;
 pub use account_id::AccountId;
 pub use error::KeychainError;
 pub use lldb::{capture_key, CaptureResult};
+#[cfg(target_os = "linux")]
+pub use mach_vm::{capture_key_linux, MachCaptureResult};
 #[cfg(target_os = "macos")]
 pub use mach_vm::{capture_key_mach, MachCaptureResult};
 pub use nickname::resolve_nickname;
@@ -162,13 +168,20 @@ pub fn check_binary(name: &'static str, version_flag: &str) -> PreflightCheck {
 
 /// 运行所有前置条件检查，返回结果列表。
 pub fn all_preflight_checks() -> Vec<PreflightCheck> {
-    vec![
-        check_sip(),
-        check_dev_tools_security(),
-        check_developer_group(),
-        check_binary("lldb", "--version"),
-        check_binary("python3", "-V"),
-    ]
+    #[cfg(target_os = "linux")]
+    {
+        linux::preflight_checks()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec![
+            check_sip(),
+            check_dev_tools_security(),
+            check_developer_group(),
+            check_binary("lldb", "--version"),
+            check_binary("python3", "-V"),
+        ]
+    }
 }
 
 /// Pre-flight checks before key extraction.

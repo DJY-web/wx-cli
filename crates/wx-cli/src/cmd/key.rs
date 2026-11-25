@@ -1,7 +1,9 @@
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use crate::util::{lookup_or_resolve_nickname, parse_hex_key_32};
 
+#[cfg(target_os = "macos")]
 pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Running pre-flight checks...");
     wx_keychain::preflight_checks()?;
@@ -69,17 +71,41 @@ pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let (key, account, version) = wx_keychain::linux_capture::capture(timeout_secs)?;
+    let mut store = wx_keychain::KeyStore::load_default()?;
+    store.set(
+        &account.account_id,
+        &hex::encode(key),
+        &version,
+        None,
+        Some(account.base_wxid),
+    );
+    store.save_default()?;
+    eprintln!("HMAC-validated Linux database key saved privately. No key material was printed.");
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub async fn cmd_key_extract(_timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+    Err("LLDB key extract is macOS-only; on Linux use `wx-cli key scan` (read-only, no WeChat restart), or `key set` with an existing key".into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
     // SIP check — task_for_pid fails with kern_return=5 when SIP is enabled,
     // even as root. This is a hard requirement (tested 2026-03-08).
-    let sip = wx_keychain::check_sip();
-    if !sip.passed {
-        return Err(format!(
+    #[cfg(target_os = "macos")]
+    {
+        let sip = wx_keychain::check_sip();
+        if !sip.passed {
+            return Err(format!(
             "{} — task_for_pid requires SIP disabled. Disable in Recovery Mode: csrutil disable",
             sip.detail
         )
-        .into());
+            .into());
+        }
     }
 
     // Find WeChat process (PID + version only).
@@ -99,7 +125,10 @@ pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
 
     // Scan process memory.
     eprintln!("Scanning WeChat process memory...");
+    #[cfg(target_os = "macos")]
     let results = wx_keychain::capture_key_mach(pid, &accounts, &wx_decrypt::MACOS_4_1_7_31)?;
+    #[cfg(target_os = "linux")]
+    let results = wx_keychain::capture_key_linux(pid, &accounts, &wx_decrypt::MACOS_4_1_7_31)?;
 
     // Count total pairs across all results
     let total_pairs: usize = results
@@ -155,6 +184,7 @@ pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
             pairs.len(),
             if pairs.len() == 1 { "" } else { "s" }
         );
+        #[cfg(target_os = "macos")]
         for pair in pairs {
             println!(
                 "{}\t{}\t{}",
@@ -171,9 +201,9 @@ pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn cmd_key_scan() -> Result<(), Box<dyn std::error::Error>> {
-    Err("key scan is only supported on macOS".into())
+    Err("key scan is only supported on macOS and Linux".into())
 }
 
 pub fn cmd_key_list() -> Result<(), Box<dyn std::error::Error>> {

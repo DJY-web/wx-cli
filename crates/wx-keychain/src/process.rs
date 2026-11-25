@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 
 use crate::error::KeychainError;
@@ -99,26 +100,34 @@ pub fn extract_base_wxid_for_account_dir_under_root(
 /// Uses `pgrep` to find the PID and checks the installed WeChat version.
 /// Does NOT use `lsof` — suitable for commands that only need PID + version.
 pub fn find_wechat_pid() -> Result<(u32, String), KeychainError> {
-    let pgrep_output = Command::new("pgrep").args(["-x", "WeChat"]).output()?;
-
-    if !pgrep_output.status.success() {
-        return Err(KeychainError::WeChatNotRunning);
+    #[cfg(target_os = "linux")]
+    {
+        let pid = crate::linux::find_wechat_pid()?;
+        Ok((pid, ensure_supported_wechat_version()?))
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let pgrep_output = Command::new("pgrep").args(["-x", "WeChat"]).output()?;
 
-    let pid_str = String::from_utf8_lossy(&pgrep_output.stdout)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        if !pgrep_output.status.success() {
+            return Err(KeychainError::WeChatNotRunning);
+        }
 
-    let pid: u32 = pid_str
-        .parse()
-        .map_err(|_| KeychainError::WeChatNotRunning)?;
+        let pid_str = String::from_utf8_lossy(&pgrep_output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
-    let version = ensure_supported_wechat_version()?;
+        let pid: u32 = pid_str
+            .parse()
+            .map_err(|_| KeychainError::WeChatNotRunning)?;
 
-    Ok((pid, version))
+        let version = ensure_supported_wechat_version()?;
+
+        Ok((pid, version))
+    }
 }
 
 /// Ensure the installed WeChat version matches the supported target.
@@ -132,21 +141,28 @@ pub fn ensure_supported_wechat_version() -> Result<String, KeychainError> {
 
 /// Get WeChat version from the application bundle.
 fn get_wechat_version() -> Result<String, KeychainError> {
-    let output = Command::new("defaults")
-        .args([
-            "read",
-            "/Applications/WeChat.app/Contents/Info.plist",
-            "CFBundleShortVersionString",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(KeychainError::Other(
-            "failed to read WeChat version from Info.plist".into(),
-        ));
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::wechat_version()
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("defaults")
+            .args([
+                "read",
+                "/Applications/WeChat.app/Contents/Info.plist",
+                "CFBundleShortVersionString",
+            ])
+            .output()?;
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        if !output.status.success() {
+            return Err(KeychainError::Other(
+                "failed to read WeChat version from Info.plist".into(),
+            ));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
 }
 
 /// Shared config directory resolved by `AppPaths`.
@@ -156,11 +172,32 @@ pub fn config_dir() -> Result<PathBuf, KeychainError> {
 }
 
 /// Default xwechat_files base path.
-fn default_xwechat_files_base() -> Result<PathBuf, KeychainError> {
+pub fn default_xwechat_files_bases() -> Result<Vec<PathBuf>, KeychainError> {
+    if let Some(root) = std::env::var_os("WX_CLI_WECHAT_DATA_ROOT") {
+        if root.is_empty() {
+            return Err(KeychainError::Other(
+                "WX_CLI_WECHAT_DATA_ROOT must not be empty".into(),
+            ));
+        }
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return Err(KeychainError::Other(
+                "WX_CLI_WECHAT_DATA_ROOT must be absolute".into(),
+            ));
+        }
+        return Ok(vec![root]);
+    }
     let ap = wx_paths::AppPaths::new().map_err(|e| KeychainError::Other(e.to_string()))?;
-    Ok(ap
-        .home()
-        .join("Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"))
+    #[cfg(target_os = "linux")]
+    {
+        Ok(crate::linux::data_roots(ap.home()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(vec![ap.home().join(
+            "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files",
+        )])
+    }
 }
 
 /// Detect account directories from the filesystem (without WeChat running).
@@ -168,11 +205,15 @@ fn default_xwechat_files_base() -> Result<PathBuf, KeychainError> {
 /// Scans `~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/`
 /// for subdirectories containing `db_storage/message/message_0.db`.
 pub fn find_account_dirs() -> Result<Vec<AccountDirInfo>, KeychainError> {
-    let base = default_xwechat_files_base()?;
-    if !base.exists() {
-        return Ok(vec![]);
+    let mut accounts = Vec::new();
+    for base in default_xwechat_files_bases()? {
+        if base.is_dir() {
+            accounts.extend(find_account_dirs_under(&base)?);
+        }
     }
-    find_account_dirs_under(&base)
+    accounts.sort_by(|a, b| a.data_dir.cmp(&b.data_dir));
+    accounts.dedup_by(|a, b| a.data_dir == b.data_dir);
+    Ok(accounts)
 }
 
 /// Detect account directories under a specified root path.
@@ -208,10 +249,17 @@ pub fn is_xwechat_files_root(path: &Path) -> bool {
 /// Unlike `find_wechat_pid()`, this does NOT perform version validation,
 /// so it won't block commands (sessions, query, etc.) that don't depend on version.
 fn is_wechat_running() -> bool {
-    Command::new("pgrep")
-        .args(["-x", "WeChat"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::find_wechat_pid().is_ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new("pgrep")
+            .args(["-x", "WeChat"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
 }
 
 /// Detect the currently active WeChat account.

@@ -23,15 +23,15 @@ impl PlatformBaseDirs {
 
         #[cfg(target_os = "linux")]
         {
-            let config_root = dirs::config_dir()
-                .ok_or(PathsError::NoConfig)?
-                .join("wx-cli");
-            let cache_root = dirs::cache_dir().ok_or(PathsError::NoCache)?.join("wx-cli");
-            let state_root = dirs::state_dir()
-                .or_else(dirs::data_local_dir)
-                .or_else(dirs::data_dir)
-                .ok_or(PathsError::NoState)?
-                .join("wx-cli");
+            let config_root =
+                xdg_base(std::env::var_os("XDG_CONFIG_HOME"), home.join(".config")).join("wx-cli");
+            let cache_root =
+                xdg_base(std::env::var_os("XDG_CACHE_HOME"), home.join(".cache")).join("wx-cli");
+            let state_root = xdg_base(
+                std::env::var_os("XDG_STATE_HOME"),
+                home.join(".local/state"),
+            )
+            .join("wx-cli");
             let logs_root = state_root.join("logs");
             Ok(Self {
                 config_root,
@@ -81,5 +81,32 @@ impl PlatformBaseDirs {
                 logs_root,
             })
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_base(value: Option<std::ffi::OsString>, fallback: PathBuf) -> PathBuf {
+    value
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or(fallback)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_or_empty_xdg_values_do_not_escape_resolved_home() {
+        for value in [None, Some("".into()), Some("relative/path".into())] {
+            assert_eq!(
+                xdg_base(value, PathBuf::from("/real-user/.config")),
+                PathBuf::from("/real-user/.config")
+            );
+        }
+        assert_eq!(
+            xdg_base(Some("/private/config".into()), PathBuf::from("/unused")),
+            PathBuf::from("/private/config")
+        );
     }
 }

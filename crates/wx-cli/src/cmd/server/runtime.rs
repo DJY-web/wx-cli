@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -106,6 +107,19 @@ pub fn remove_runtime_state(ap: &AppPaths) -> Result<(), Box<dyn std::error::Err
 }
 
 pub fn pid_is_running(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        if stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X"))
+        {
+            return false;
+        }
+    }
     let result = unsafe { libc::kill(pid as i32, 0) };
     if result == 0 {
         return true;
@@ -120,6 +134,9 @@ pub fn pid_matches_managed_worker(pid: u32, worker_id: &str) -> bool {
 }
 
 pub fn terminate_pid(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("refusing to signal an invalid process ID".into());
+    }
     let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     if result == 0 {
         Ok(())
@@ -129,19 +146,32 @@ pub fn terminate_pid(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn process_command_line(pid: u32) -> Option<String> {
-    let output = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(target_os = "linux")]
+    {
+        let data = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let parts: Vec<_> = data
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(String::from_utf8_lossy)
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" "))
     }
-    let command = String::from_utf8(output.stdout).ok()?;
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let command = String::from_utf8(output.stdout).ok()?;
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 }
 
@@ -154,6 +184,33 @@ pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     !pid_is_running(pid)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn dead_unreaped_worker_is_not_running() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_is_running(child.id()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let running = pid_is_running(child.id());
+        child.wait().unwrap();
+        assert!(!running);
+        assert!(!pid_is_running(0));
+        assert!(!pid_is_running(u32::MAX));
+    }
+
+    #[test]
+    fn proc_command_line_works_without_ps() {
+        assert!(process_command_line(std::process::id()).is_some_and(|s| !s.is_empty()));
+    }
 }
 
 pub fn base_url(host: &str, port: u16) -> String {

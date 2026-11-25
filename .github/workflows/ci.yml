@@ -20,17 +20,29 @@ jobs:
       - run: cargo fmt --check
 
   clippy:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - run: cargo clippy -- -D warnings
 
   test:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev cmake pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s tests/linux -v

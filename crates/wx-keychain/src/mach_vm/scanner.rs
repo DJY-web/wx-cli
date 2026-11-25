@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
 
 use crate::error::KeychainError;
@@ -41,10 +42,6 @@ impl<R: MemoryReader> MemoryScanner<R> {
         let regions = self.reader.rw_regions()?;
         let candidates = self.scan_regions(&regions)?;
 
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut results = Vec::new();
         let mut seen = HashSet::new();
 
@@ -52,9 +49,133 @@ impl<R: MemoryReader> MemoryScanner<R> {
             self.validate_candidate(found, db_salts, params, &mut results, &mut seen);
         }
 
+        #[cfg(target_os = "linux")]
+        if results.len() < db_salts.len() {
+            self.scan_sqlcipher_contexts(&regions, db_salts, params, &mut results, &mut seen);
+        }
+
         self.cross_validate_known_keys(db_salts, params, &mut results, &mut seen);
 
         Ok(results)
+    }
+
+    /// Linux 4.1 may not retain SQL text keys. Recognize SQLCipher's parameter
+    /// header and follow bounded, mapped pointers to its live cipher contexts.
+    /// This does not attach a debugger or modify memory. Every candidate must
+    /// match a known database salt AND pass that database's first-page HMAC.
+    #[cfg(target_os = "linux")]
+    fn scan_sqlcipher_contexts(
+        &self,
+        regions: &[crate::mach_vm::MemRegion],
+        db_salts: &[([u8; 16], &Path)],
+        params: &wx_decrypt::CryptoParams,
+        results: &mut Vec<ScanResult>,
+        seen: &mut HashSet<([u8; 32], [u8; 16])>,
+    ) {
+        // codec_ctx shared integer prefix from SQLCipher and Tencent's wcdb fork:
+        // kdf_iter, fast_kdf_iter, salt/key/iv/block/page sizes. Tencent inserts
+        // keyspec_sz after page_sz, so do not assume the downstream field layout.
+        let needle: Vec<u8> = [params.kdf_iter, 2, 16, 32, 16, 16, params.page_size as u32]
+            .iter()
+            .flat_map(|n| n.to_le_bytes())
+            .collect();
+        let mapped = |addr: u64, len: u64| {
+            regions
+                .iter()
+                .any(|r| addr >= r.start && addr.checked_add(len).is_some_and(|end| end <= r.end))
+        };
+        let mut visited = HashSet::new();
+        for region in regions {
+            let mut offset = 0;
+            let mut carry = Vec::new();
+            while region.start + offset < region.end {
+                let len = CHUNK_SIZE.min((region.end - region.start - offset) as usize);
+                let data = match self.reader.read_bytes(region.start + offset, len) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        offset += len as u64;
+                        carry.clear();
+                        continue;
+                    }
+                };
+                let base = region.start + offset - carry.len() as u64;
+                let mut buf = carry;
+                buf.extend_from_slice(&data);
+                for (position, _) in buf
+                    .windows(needle.len())
+                    .enumerate()
+                    .filter(|(_, bytes)| *bytes == needle.as_slice())
+                {
+                    let hit = base + position as u64;
+                    if !visited.insert(hit) {
+                        continue;
+                    }
+                    let context_start = hit.saturating_sub(16) & !7;
+                    let Ok(context) = self.reader.read_bytes(context_start, 208) else {
+                        continue;
+                    };
+                    let pointers: Vec<u64> = context
+                        .chunks_exact(8)
+                        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                        .filter(|p| mapped(*p, 64))
+                        .collect();
+                    let salts: Vec<_> = pointers
+                        .iter()
+                        .filter_map(|p| self.reader.read_bytes(*p, 16).ok())
+                        .filter_map(|bytes| {
+                            db_salts
+                                .iter()
+                                .find(|(salt, _)| bytes.as_slice() == salt)
+                                .copied()
+                        })
+                        .collect();
+                    if salts.is_empty() {
+                        continue;
+                    }
+                    for ptr in &pointers {
+                        let Ok(object) = self.reader.read_bytes(*ptr, 64) else {
+                            continue;
+                        };
+                        let mut key_addresses = vec![*ptr];
+                        key_addresses.extend(
+                            object
+                                .chunks_exact(8)
+                                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                                .filter(|p| mapped(*p, 32)),
+                        );
+                        for key_address in key_addresses {
+                            let Ok(bytes) = self.reader.read_bytes(key_address, 32) else {
+                                continue;
+                            };
+                            let Ok(enc_key) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                                continue;
+                            };
+                            for (salt, db_path) in &salts {
+                                if !seen.contains(&(enc_key, *salt))
+                                    && validate_key_for_db(&enc_key, salt, db_path, params)
+                                {
+                                    seen.insert((enc_key, *salt));
+                                    results.push(ScanResult {
+                                        enc_key,
+                                        salt: *salt,
+                                        db_path: db_path.to_path_buf(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                carry = buf[buf.len().saturating_sub(needle.len() - 1)..].to_vec();
+                offset += len as u64;
+            }
+        }
+        if std::env::var_os("WX_CLI_SCAN_DEBUG").is_some() {
+            eprintln!(
+                "SQLCipher context headers: {}; HMAC-validated keys: {}",
+                visited.len(),
+                results.len()
+            );
+        }
     }
 
     fn validate_candidate(
@@ -194,10 +315,14 @@ fn validate_key_for_db(
     db_path: &Path,
     params: &wx_decrypt::CryptoParams,
 ) -> bool {
-    let first_page = match std::fs::read(db_path) {
-        Ok(data) if data.len() >= params.page_size => data[..params.page_size].to_vec(),
+    let mut file = match std::fs::File::open(db_path) {
+        Ok(file) => file,
         _ => return false,
     };
+    let mut first_page = vec![0; params.page_size];
+    if file.read_exact(&mut first_page).is_err() {
+        return false;
+    }
 
     wx_decrypt::validate_enc_key(&first_page, enc_key, salt, params)
 }
@@ -230,6 +355,45 @@ mod tests {
 
     fn make_pattern(enc_key: &[u8; 32], salt: &[u8; 16]) -> Vec<u8> {
         format!("x'{}{}'", hex::encode(enc_key), hex::encode(salt)).into_bytes()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_context_scan_requires_hmac_and_handles_chunk_boundary() {
+        let key = [0xAB; 32];
+        let salt = [0x01; 16];
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("context.db");
+        std::fs::write(&db, build_first_page(&key, &salt)).unwrap();
+        for valid in [true, false] {
+            let mut data = vec![0u8; CHUNK_SIZE + 4096];
+            let ctx = CHUNK_SIZE - 16;
+            let header: Vec<u8> = [0u32, 256000, 2, 16, 32, 16, 16, 4096, 80, 64]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            data[ctx..ctx + header.len()].copy_from_slice(&header);
+            data[ctx + 64..ctx + 72].copy_from_slice(&0x1000u64.to_le_bytes());
+            data[ctx + 96..ctx + 104].copy_from_slice(&0x2000u64.to_le_bytes());
+            data[0x1000..0x1010].copy_from_slice(&salt);
+            data[0x2008..0x2010].copy_from_slice(&0x3000u64.to_le_bytes());
+            data[0x3000..0x3020].copy_from_slice(if valid { &key } else { &[0xCD; 32] });
+            let len = data.len();
+            let scanner = MemoryScanner::new(MockReader {
+                regions: vec![MemRegion {
+                    start: 0,
+                    end: len as u64,
+                }],
+                data,
+            });
+            let results = scanner
+                .scan(&[(salt, db.as_path())], &MACOS_4_1_7_31)
+                .unwrap();
+            assert_eq!(results.len(), usize::from(valid));
+            if valid {
+                assert_eq!(results[0].enc_key, key);
+            }
+        }
     }
 
     fn make_key_only_pattern(enc_key: &[u8; 32]) -> Vec<u8> {

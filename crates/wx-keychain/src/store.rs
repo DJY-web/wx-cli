@@ -98,8 +98,37 @@ impl KeyStore {
         let content = toml::to_string_pretty(self)
             .map_err(|e| KeychainError::Store(format!("failed to serialize: {}", e)))?;
 
-        let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, &content)?;
+        #[cfg(target_os = "linux")]
+        let tmp_path = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| KeychainError::Other(e.to_string()))?
+                .as_nanos();
+            let tmp = path.with_extension(format!("toml.tmp-{}-{nonce}", std::process::id()));
+            // Keep secrets private from the first write, and never follow an
+            // existing temporary-file symlink.
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            if let Err(error) = file
+                .write_all(content.as_bytes())
+                .and_then(|_| file.sync_all())
+            {
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
+            tmp
+        };
+        #[cfg(not(target_os = "linux"))]
+        let tmp_path = {
+            let tmp = path.with_extension("toml.tmp");
+            fs::write(&tmp, &content)?;
+            tmp
+        };
         fs::rename(&tmp_path, path).inspect_err(|_| {
             // Clean up the temp file on rename failure.
             let _ = fs::remove_file(&tmp_path);
@@ -355,6 +384,38 @@ impl KeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_save_replaces_public_file_privately_without_following_old_temp_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("wx-keys-{}-{nonce}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("keys.toml");
+        let victim = directory.join("untouched");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&victim, "unchanged").unwrap();
+        symlink(&victim, path.with_extension("toml.tmp")).unwrap();
+        let mut store = KeyStore::default();
+        store.set("test", &"ab".repeat(32), "test", None, None);
+        store.save(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            KeyStore::load(&path).unwrap().get("test").unwrap().data_key,
+            "ab".repeat(32)
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "unchanged");
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn test_old_keys_toml_without_nickname_base_wxid() {

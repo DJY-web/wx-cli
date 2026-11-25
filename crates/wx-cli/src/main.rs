@@ -17,7 +17,7 @@ pub(crate) mod visibility_projection;
 #[derive(Parser)]
 #[command(
     name = "wx-cli",
-    about = "WeChat database decryption tool (macOS 4.1.x)"
+    about = "WeChat database decryption and query tool (macOS / Linux 4.1.x)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -525,7 +525,7 @@ impl From<SortOrderArg> for wx_db::SortOrder {
 
 #[derive(Subcommand)]
 enum KeyAction {
-    /// Extract key via LLDB (requires SIP disabled, auto-detects current account)
+    /// Explicit debugger capture (macOS: LLDB; Linux ARM64: GDB + manual re-login)
     Extract {
         /// Timeout in seconds for LLDB capture
         #[arg(long, default_value = "120")]
@@ -548,7 +548,7 @@ enum KeyAction {
         /// 16-byte image AES key (ASCII string or hex)
         image_key: String,
     },
-    /// Scan WeChat process memory for pre-derived encryption keys (requires SIP disabled + sudo, no restart needed)
+    /// Scan WeChat memory without restart (macOS: SIP disabled; Linux: scoped /proc permissions)
     Scan,
 }
 

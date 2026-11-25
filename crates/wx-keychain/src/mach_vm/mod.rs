@@ -55,7 +55,23 @@ pub fn capture_key_mach(
     params: &wx_decrypt::CryptoParams,
 ) -> Result<Vec<MachCaptureResult>, KeychainError> {
     let reader = MachVmReader::attach(pid)?;
+    capture_key_with_reader(reader, accounts, params)
+}
 
+#[cfg(target_os = "linux")]
+pub fn capture_key_linux(
+    pid: u32,
+    accounts: &[AccountDirInfo],
+    params: &wx_decrypt::CryptoParams,
+) -> Result<Vec<MachCaptureResult>, KeychainError> {
+    capture_key_with_reader(crate::linux::ProcMemReader::attach(pid)?, accounts, params)
+}
+
+fn capture_key_with_reader<R: MemoryReader>(
+    reader: R,
+    accounts: &[AccountDirInfo],
+    params: &wx_decrypt::CryptoParams,
+) -> Result<Vec<MachCaptureResult>, KeychainError> {
     // Collect (salt, db_path) pairs for ALL candidate DBs across all accounts.
     let mut db_salts: Vec<([u8; 16], PathBuf)> = Vec::new();
     for account in accounts {
